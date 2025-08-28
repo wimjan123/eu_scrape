@@ -1,0 +1,33 @@
+# EU Parliament Scraper Configuration
+api:
+  opendata:
+    base_url: "https://data.europarl.europa.eu/api"
+    timeout: 30
+    rate_limit: 0.5  # requests per second
+  eurlex:
+    base_url: "http://publications.europa.eu/webapi/rdf/sparql"
+    timeout: 60
+    rate_limit: 0.5
+  verbatim:
+    base_url: "https://www.europarl.europa.eu/doceo/document"
+    timeout: 45
+    rate_limit: 0.33
+
+processing:
+  date_range:
+    start: "2024-01-01"
+    end: "2024-12-31"
+  languages: ["en", "fr", "de"]
+  max_workers: 4
+  chunk_size: 100
+  
+quality:
+  min_speech_length: 10  # minimum words
+  max_speech_length: 10000
+  speaker_confidence_threshold: 0.8
+  validation_sample_size: 25
+
+output:
+  formats: ["csv", "jsonl"]
+  include_metadata: true
+  timestamp_format: "iso8601_utc"

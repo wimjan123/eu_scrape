@@ -1,0 +1,1 @@
+"""Core module for EU Parliament scraper."""

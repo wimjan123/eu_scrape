@@ -1,0 +1,26 @@
+# EU Parliament Scraper - Requirements
+# Core Dependencies
+requests>=2.28.0           # HTTP client with session management
+beautifulsoup4>=4.11.0     # HTML/XML parsing
+lxml>=4.9.0               # Fast XML processing
+pandas>=1.5.0             # Data manipulation
+numpy>=1.24.0             # Numerical operations
+pydantic>=1.10.0          # Data validation and settings
+PyYAML>=6.0               # Configuration management
+
+# Fuzzy Matching & NLP
+fuzzywuzzy>=0.18.0        # Fuzzy string matching
+rapidfuzz>=2.13.0         # Fast fuzzy matching
+python-Levenshtein>=0.20.0 # String distance
+
+# Web Automation (Fallback)
+playwright>=1.30.0         # Browser automation
+
+# Testing & Quality
+pytest>=7.2.0             # Testing framework
+httpx>=0.24.0             # Async HTTP for testing
+pytest-asyncio>=0.21.0    # Async testing support
+
+# Logging & Monitoring
+structlog>=22.3.0         # Structured logging
+psutil>=5.9.0             # System monitoring
