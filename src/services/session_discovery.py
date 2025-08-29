@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 
 
 class SessionDiscoveryService:
-    """Service for discovering and cataloging plenary sessions."""
+    """Enhanced service for discovering and cataloging plenary sessions with batch processing."""
     
     def __init__(self, opendata_client: OpenDataClient, eurlex_client: EURLexClient = None):
         """
@@ -30,16 +30,81 @@ class SessionDiscoveryService:
         self.eurlex_client = eurlex_client
         self.sessions_cache: Dict[str, SessionMetadata] = {}
         self.discovery_cache_file = Path("data/cache/session_discovery.json")
+        self.batch_cache_file = Path("data/cache/batch_discovery.json")
         
         # Ensure cache directory exists
         self.discovery_cache_file.parent.mkdir(parents=True, exist_ok=True)
         
-        logger.info("Session discovery service initialized")
+        # Batch processing configuration
+        self.batch_size = 50  # Sessions per batch
+        self.max_concurrent_requests = 5
+        self.cache_ttl = timedelta(hours=24)
+        
+        logger.info("Enhanced session discovery service initialized with batch processing")
+    
+    async def discover_sessions_batch(self, start_date: str, end_date: str, 
+                                    batch_size: int = None,
+                                    progress_callback: callable = None) -> List[SessionMetadata]:
+        """
+        Discover plenary sessions in date range with batch processing.
+        
+        Args:
+            start_date: Start date (YYYY-MM-DD format)
+            end_date: End date (YYYY-MM-DD format)
+            batch_size: Override default batch size
+            progress_callback: Optional progress reporting callback
+            
+        Returns:
+            List of discovered session metadata
+        """
+        batch_size = batch_size or self.batch_size
+        logger.info(f"Starting batch session discovery: {start_date} to {end_date}, batch_size={batch_size}")
+        
+        try:
+            # Check cache first
+            cache_key = f"{start_date}_{end_date}"
+            if cached_result := await self._get_batch_cache(cache_key):
+                logger.info(f"Retrieved {len(cached_result)} sessions from batch cache")
+                return cached_result
+            
+            # Discover sessions in batches
+            all_sessions = []
+            date_ranges = self._split_date_range(start_date, end_date, batch_size)
+            
+            for i, (batch_start, batch_end) in enumerate(date_ranges):
+                logger.info(f"Processing batch {i+1}/{len(date_ranges)}: {batch_start} to {batch_end}")
+                
+                try:
+                    batch_sessions = await self._discover_batch(batch_start, batch_end)
+                    all_sessions.extend(batch_sessions)
+                    
+                    if progress_callback:
+                        progress_callback(i + 1, len(date_ranges), len(batch_sessions))
+                    
+                    logger.info(f"Batch {i+1} completed: {len(batch_sessions)} sessions discovered")
+                    
+                except Exception as e:
+                    logger.error(f"Batch {i+1} failed: {e}")
+                    # Continue with other batches
+                    continue
+            
+            # Enrich sessions with additional metadata
+            enriched_sessions = await self._enrich_sessions_batch(all_sessions)
+            
+            # Cache the results
+            await self._set_batch_cache(cache_key, enriched_sessions)
+            
+            logger.info(f"Batch discovery completed: {len(enriched_sessions)} total sessions")
+            return enriched_sessions
+            
+        except Exception as e:
+            logger.error(f"Batch session discovery failed: {e}")
+            raise ProcessingError(f"Failed to discover sessions in batch: {e}")
     
     def discover_sessions(self, start_date: str, end_date: str, 
                          force_refresh: bool = False) -> List[SessionMetadata]:
         """
-        Discover plenary sessions in date range.
+        Discover plenary sessions in date range (legacy sync method).
         
         Args:
             start_date: Start date (YYYY-MM-DD format)
@@ -49,403 +114,453 @@ class SessionDiscoveryService:
         Returns:
             List of discovered session metadata
         """
-        cache_key = f"{start_date}_{end_date}"
-        
-        logger.info(
-            "Starting session discovery",
-            start_date=start_date,
-            end_date=end_date,
-            force_refresh=force_refresh
-        )
-        
-        # Check cache first
-        if not force_refresh:
-            cached_sessions = self._load_from_cache(cache_key)
-            if cached_sessions:
-                logger.info("Using cached session data", count=len(cached_sessions))
-                return cached_sessions
+        logger.info(f"Discovering sessions from {start_date} to {end_date}")
         
         try:
-            # Discover sessions from multiple sources
-            sessions = []
+            # Check cache first
+            cache_key = f"{start_date}_{end_date}"
+            if not force_refresh:
+                cached_sessions = self._load_from_cache(cache_key)
+                if cached_sessions:
+                    logger.info(f"Found {len(cached_sessions)} sessions in cache")
+                    return cached_sessions
             
-            # Primary source: Open Data Portal
-            opendata_sessions = self._discover_from_opendata(start_date, end_date)
-            sessions.extend(opendata_sessions)
+            # Fetch session data from OpenData Portal
+            opendata_sessions = self._fetch_opendata_sessions(start_date, end_date)
+            logger.info(f"Retrieved {len(opendata_sessions)} sessions from OpenData Portal")
             
-            # Secondary source: EUR-Lex (if available)
+            # Enrich with EUR-Lex data if client available
             if self.eurlex_client:
-                eurlex_sessions = self._discover_from_eurlex(start_date, end_date)
-                sessions = self._merge_session_data(sessions, eurlex_sessions)
+                enriched_sessions = self._enrich_with_eurlex(opendata_sessions)
+                logger.info(f"Enhanced {len(enriched_sessions)} sessions with EUR-Lex data")
+            else:
+                enriched_sessions = opendata_sessions
             
-            # Validate and enrich session data
-            validated_sessions = []
-            for session in sessions:
-                if self._validate_session_metadata(session):
-                    enriched_session = self._enrich_session_metadata(session)
-                    validated_sessions.append(enriched_session)
-                else:
-                    logger.warning("Invalid session metadata", session_id=session.session_id)
+            # Validate and clean session data
+            validated_sessions = self._validate_sessions(enriched_sessions)
+            logger.info(f"Validated {len(validated_sessions)} sessions")
             
-            # Cache results
+            # Cache the results
             self._save_to_cache(cache_key, validated_sessions)
             
-            logger.info(
-                "Session discovery completed",
-                total_found=len(validated_sessions),
-                start_date=start_date,
-                end_date=end_date
-            )
+            return validated_sessions
+            
+        except APIError as e:
+            logger.error(f"API error during session discovery: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during session discovery: {e}")
+            raise ProcessingError(f"Failed to discover sessions: {e}")
+    
+    async def _discover_batch(self, start_date: str, end_date: str) -> List[SessionMetadata]:
+        """Discover sessions for a specific date batch."""
+        try:
+            # Fetch from OpenData Portal with error handling
+            opendata_sessions = await self._fetch_opendata_sessions_async(start_date, end_date)
+            
+            # Add basic validation
+            validated_sessions = []
+            for session in opendata_sessions:
+                try:
+                    if self._validate_session_basic(session):
+                        validated_sessions.append(session)
+                except Exception as e:
+                    logger.warning(f"Session validation failed, skipping: {e}")
+                    continue
             
             return validated_sessions
             
         except Exception as e:
-            logger.error("Session discovery failed", error=str(e))
-            raise ProcessingError(f"Session discovery failed: {e}")
+            logger.error(f"Batch discovery failed for {start_date}-{end_date}: {e}")
+            return []
     
-    def _discover_from_opendata(self, start_date: str, end_date: str) -> List[SessionMetadata]:
-        """Discover sessions from Open Data Portal."""
-        logger.info("Discovering sessions from Open Data Portal")
+    async def _enrich_sessions_batch(self, sessions: List[SessionMetadata]) -> List[SessionMetadata]:
+        """Enrich sessions with additional metadata in batches."""
+        if not self.eurlex_client:
+            return sessions
         
+        logger.info(f"Enriching {len(sessions)} sessions with EUR-Lex metadata")
+        enriched = []
+        
+        # Process in smaller batches to avoid overwhelming EUR-Lex
+        eurlex_batch_size = 10
+        for i in range(0, len(sessions), eurlex_batch_size):
+            batch = sessions[i:i + eurlex_batch_size]
+            
+            try:
+                enriched_batch = await self._enrich_eurlex_batch(batch)
+                enriched.extend(enriched_batch)
+                logger.debug(f"Enriched batch {i//eurlex_batch_size + 1}: {len(enriched_batch)} sessions")
+                
+            except Exception as e:
+                logger.warning(f"EUR-Lex enrichment failed for batch {i//eurlex_batch_size + 1}: {e}")
+                # Add original sessions without enrichment
+                enriched.extend(batch)
+        
+        return enriched
+    
+    async def _fetch_opendata_sessions_async(self, start_date: str, end_date: str) -> List[SessionMetadata]:
+        """Async version of OpenData Portal session fetching."""
+        # Simulate async operation for now - can be enhanced with actual async HTTP later
+        return self._fetch_opendata_sessions(start_date, end_date)
+    
+    async def _enrich_eurlex_batch(self, sessions: List[SessionMetadata]) -> List[SessionMetadata]:
+        """Enrich a batch of sessions with EUR-Lex data."""
+        enriched = []
+        for session in sessions:
+            try:
+                # Add EUR-Lex enrichment logic here
+                enriched_session = self._enrich_single_session_eurlex(session)
+                enriched.append(enriched_session)
+            except Exception as e:
+                logger.warning(f"EUR-Lex enrichment failed for session {session.session_id}: {e}")
+                enriched.append(session)  # Keep original
+        return enriched
+    
+    def _enrich_single_session_eurlex(self, session: SessionMetadata) -> SessionMetadata:
+        """Enrich single session with EUR-Lex metadata."""
         try:
-            raw_sessions = self.opendata_client.get_plenary_sessions(start_date, end_date)
+            # Query EUR-Lex for additional session information
+            eurlex_data = self.eurlex_client.get_session_metadata(session.session_id)
+            
+            if eurlex_data:
+                # Merge EUR-Lex data into session metadata
+                session.additional_metadata = session.additional_metadata or {}
+                session.additional_metadata.update(eurlex_data)
+                
+                # Extract specific fields if available
+                if 'document_urls' in eurlex_data:
+                    session.verbatim_urls.extend(eurlex_data['document_urls'])
+                
+            return session
+            
+        except Exception as e:
+            logger.debug(f"EUR-Lex enrichment failed for session {session.session_id}: {e}")
+            return session
+    
+    def _split_date_range(self, start_date: str, end_date: str, batch_size: int) -> List[tuple]:
+        """Split date range into batches for processing."""
+        from datetime import datetime, timedelta
+        
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        # Calculate days per batch (roughly batch_size sessions / ~2 sessions per week)
+        days_per_batch = max(7, batch_size // 2)  # At least 1 week per batch
+        
+        date_ranges = []
+        current_start = start
+        
+        while current_start < end:
+            current_end = min(current_start + timedelta(days=days_per_batch), end)
+            date_ranges.append((
+                current_start.strftime("%Y-%m-%d"),
+                current_end.strftime("%Y-%m-%d")
+            ))
+            current_start = current_end + timedelta(days=1)
+        
+        return date_ranges
+    
+    async def _get_batch_cache(self, cache_key: str) -> Optional[List[SessionMetadata]]:
+        """Get batch results from cache."""
+        try:
+            if not self.batch_cache_file.exists():
+                return None
+            
+            with open(self.batch_cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            
+            if cache_key not in cache_data:
+                return None
+            
+            cached_entry = cache_data[cache_key]
+            
+            # Check cache age
+            cache_time = datetime.fromisoformat(cached_entry['timestamp'])
+            if datetime.now() - cache_time > self.cache_ttl:
+                logger.debug(f"Batch cache expired for key: {cache_key}")
+                return None
+            
+            # Deserialize sessions
+            sessions = []
+            for session_data in cached_entry['sessions']:
+                try:
+                    session = SessionMetadata(**session_data)
+                    sessions.append(session)
+                except Exception as e:
+                    logger.warning(f"Failed to deserialize cached session: {e}")
+                    continue
+            
+            return sessions
+            
+        except Exception as e:
+            logger.debug(f"Failed to load batch cache: {e}")
+            return None
+    
+    async def _set_batch_cache(self, cache_key: str, sessions: List[SessionMetadata]):
+        """Save batch results to cache."""
+        try:
+            # Load existing cache
+            cache_data = {}
+            if self.batch_cache_file.exists():
+                with open(self.batch_cache_file, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+            
+            # Serialize sessions
+            session_data = []
+            for session in sessions:
+                try:
+                    session_dict = session.dict()
+                    session_data.append(session_dict)
+                except Exception as e:
+                    logger.warning(f"Failed to serialize session for cache: {e}")
+                    continue
+            
+            # Store in cache
+            cache_data[cache_key] = {
+                'timestamp': datetime.now().isoformat(),
+                'sessions': session_data
+            }
+            
+            # Write cache file
+            with open(self.batch_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            
+            logger.debug(f"Saved {len(sessions)} sessions to batch cache with key: {cache_key}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save batch cache: {e}")
+    
+    def _validate_session_basic(self, session: SessionMetadata) -> bool:
+        """Basic session validation for batch processing."""
+        try:
+            # Check required fields
+            if not session.session_id or not session.session_date:
+                return False
+            
+            # Check date format
+            if not isinstance(session.session_date, datetime):
+                return False
+            
+            # Check session type
+            if session.session_type not in ['plenary', 'committee', 'other']:
+                session.session_type = 'plenary'  # Default
+            
+            return True
+            
+        except Exception as e:
+            logger.debug(f"Session validation failed: {e}")
+            return False
+    
+    def get_discovery_stats(self) -> Dict[str, Any]:
+        """Get discovery service statistics."""
+        stats = {
+            'sessions_cached': len(self.sessions_cache),
+            'cache_file_exists': self.discovery_cache_file.exists(),
+            'batch_cache_exists': self.batch_cache_file.exists(),
+            'batch_size': self.batch_size,
+            'cache_ttl_hours': self.cache_ttl.total_seconds() / 3600
+        }
+        
+        # Add cache file sizes if they exist
+        if self.discovery_cache_file.exists():
+            stats['cache_size_kb'] = self.discovery_cache_file.stat().st_size // 1024
+        
+        if self.batch_cache_file.exists():
+            stats['batch_cache_size_kb'] = self.batch_cache_file.stat().st_size // 1024
+        
+        return stats
+
+    
+    # ===== Phase 1 Compatible Methods (preserved for backward compatibility) =====
+    
+    def _fetch_opendata_sessions(self, start_date: str, end_date: str) -> List[SessionMetadata]:
+        """Fetch session data from OpenData Portal."""
+        try:
+            sessions_data = self.opendata_client.get_plenary_sessions(start_date, end_date)
             
             sessions = []
-            for raw_session in raw_sessions:
+            for session_data in sessions_data:
                 try:
-                    session = self._convert_opendata_session(raw_session)
+                    session = self._parse_opendata_session(session_data)
                     if session:
                         sessions.append(session)
                 except Exception as e:
-                    logger.warning(
-                        "Failed to convert OpenData session",
-                        error=str(e),
-                        session_data=raw_session
-                    )
+                    logger.warning(f"Failed to parse session data: {e}")
                     continue
             
-            logger.info("OpenData sessions discovered", count=len(sessions))
             return sessions
             
         except APIError as e:
-            logger.error("OpenData session discovery failed", error=str(e))
-            return []
+            logger.error(f"OpenData API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching OpenData sessions: {e}")
+            raise ProcessingError(f"Failed to fetch OpenData sessions: {e}")
     
-    def _discover_from_eurlex(self, start_date: str, end_date: str) -> List[SessionMetadata]:
-        """Discover sessions from EUR-Lex."""
-        if not self.eurlex_client:
-            return []
-        
-        logger.info("Discovering sessions from EUR-Lex")
-        
+    def _parse_opendata_session(self, session_data: Dict[str, Any]) -> Optional[SessionMetadata]:
+        """Parse session data from OpenData Portal format."""
         try:
-            documents = self.eurlex_client.get_plenary_documents(start_date, end_date)
+            # Extract basic session information
+            session_id = session_data.get('session_id') or session_data.get('id')
+            session_date = session_data.get('session_date') or session_data.get('date')
             
-            sessions = []
-            processed_sessions = set()
+            if not session_id or not session_date:
+                logger.debug(f"Missing required fields in session data: {session_data}")
+                return None
             
-            for doc in documents:
-                try:
-                    session = self._convert_eurlex_document(doc)
-                    if session and session.session_id not in processed_sessions:
-                        sessions.append(session)
-                        processed_sessions.add(session.session_id)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to convert EUR-Lex document",
-                        error=str(e),
-                        document=doc
-                    )
+            # Parse date if it's a string
+            if isinstance(session_date, str):
+                session_date = parse_session_date(session_date)
+            
+            # Create session metadata
+            session = SessionMetadata(
+                session_id=str(session_id),
+                session_date=session_date,
+                session_type=session_data.get('session_type', 'plenary'),
+                location=session_data.get('location', 'Unknown'),
+                title=session_data.get('title', f"Session {session_id}"),
+                agenda_urls=session_data.get('agenda_urls', []),
+                verbatim_urls=session_data.get('verbatim_urls', []),
+                additional_metadata=session_data.get('additional_metadata', {})
+            )
+            
+            return session
+            
+        except Exception as e:
+            logger.error(f"Error parsing session data: {e}")
+            return None
+    
+    def _enrich_with_eurlex(self, sessions: List[SessionMetadata]) -> List[SessionMetadata]:
+        """Enrich sessions with EUR-Lex data."""
+        enriched_sessions = []
+        
+        for session in sessions:
+            try:
+                enriched_session = self._enrich_single_session_eurlex(session)
+                enriched_sessions.append(enriched_session)
+                
+            except Exception as e:
+                logger.warning(f"EUR-Lex enrichment failed for session {session.session_id}: {e}")
+                enriched_sessions.append(session)  # Keep original
+        
+        return enriched_sessions
+    
+    def _validate_sessions(self, sessions: List[SessionMetadata]) -> List[SessionMetadata]:
+        """Validate and filter session data."""
+        validated_sessions = []
+        
+        for session in sessions:
+            try:
+                # Basic validation
+                if not session.session_id or not session.session_date:
+                    logger.debug(f"Skipping session with missing required fields")
                     continue
-            
-            logger.info("EUR-Lex sessions discovered", count=len(sessions))
-            return sessions
-            
-        except APIError as e:
-            logger.error("EUR-Lex session discovery failed", error=str(e))
-            return []
-    
-    def _convert_opendata_session(self, raw_session: Dict[str, Any]) -> Optional[SessionMetadata]:
-        """Convert OpenData session to SessionMetadata."""
-        try:
-            # Extract session ID
-            session_id = raw_session.get('identifier') or raw_session.get('id', '')
-            if not session_id:
-                return None
-            
-            # Parse date
-            date_str = raw_session.get('date', '')
-            session_date = parse_session_date(date_str)
-            if not session_date:
-                logger.warning("Invalid session date", date_str=date_str)
-                return None
-            
-            # Extract title
-            title = ''
-            if 'title' in raw_session:
-                if isinstance(raw_session['title'], dict):
-                    title = raw_session['title'].get('en', '') or str(raw_session['title'])
-                else:
-                    title = str(raw_session['title'])
-            
-            # Extract language
-            language = raw_session.get('language', 'en')
-            if isinstance(language, dict):
-                language = language.get('en', 'en')
-            
-            # Extract URLs
-            verbatim_url = self._extract_verbatim_url(raw_session)
-            agenda_url = self._extract_agenda_url(raw_session)
-            
-            return SessionMetadata(
-                session_id=session_id,
-                date=session_date,
-                title=title,
-                session_type='plenary',
-                language=language,
-                verbatim_url=verbatim_url,
-                agenda_url=agenda_url,
-                status='discovered'
-            )
-            
-        except Exception as e:
-            logger.error("Failed to convert OpenData session", error=str(e))
-            return None
-    
-    def _convert_eurlex_document(self, document: Dict[str, Any]) -> Optional[SessionMetadata]:
-        """Convert EUR-Lex document to SessionMetadata."""
-        try:
-            # Extract identifier for session ID
-            identifier = document.get('identifier', '')
-            if not identifier:
-                return None
-            
-            # Parse date
-            date_str = document.get('date', '')
-            session_date = parse_session_date(date_str)
-            if not session_date:
-                return None
-            
-            # Create session ID from identifier and date
-            session_id = f"eurlex_{identifier}_{session_date.strftime('%Y-%m-%d')}"
-            
-            return SessionMetadata(
-                session_id=session_id,
-                date=session_date,
-                title=document.get('title', ''),
-                session_type='plenary',
-                language=document.get('language', 'en'),
-                verbatim_url=document.get('document_uri'),
-                agenda_url=None,
-                status='discovered'
-            )
-            
-        except Exception as e:
-            logger.error("Failed to convert EUR-Lex document", error=str(e))
-            return None
-    
-    def _extract_verbatim_url(self, raw_session: Dict[str, Any]) -> Optional[str]:
-        """Extract verbatim report URL from session data."""
-        # Check for direct URL fields
-        for url_field in ['verbatim_url', 'document_url', 'url', 'link']:
-            if url_field in raw_session and raw_session[url_field]:
-                url = raw_session[url_field]
-                if 'CRE' in str(url) or 'verbatim' in str(url).lower():
-                    return str(url)
+                
+                # Date validation
+                if not isinstance(session.session_date, datetime):
+                    logger.debug(f"Skipping session with invalid date: {session.session_date}")
+                    continue
+                
+                # Additional validation can be added here
+                validated_sessions.append(session)
+                
+            except Exception as e:
+                logger.warning(f"Session validation error: {e}")
+                continue
         
-        # Check in nested structures
-        if 'documents' in raw_session:
-            documents = raw_session['documents']
-            if isinstance(documents, list):
-                for doc in documents:
-                    if isinstance(doc, dict) and doc.get('type') == 'verbatim':
-                        return doc.get('url')
-        
-        return None
-    
-    def _extract_agenda_url(self, raw_session: Dict[str, Any]) -> Optional[str]:
-        """Extract agenda URL from session data."""
-        # Check for direct agenda URL fields
-        for url_field in ['agenda_url', 'agenda', 'order_of_business']:
-            if url_field in raw_session and raw_session[url_field]:
-                return str(raw_session[url_field])
-        
-        # Check in documents
-        if 'documents' in raw_session:
-            documents = raw_session['documents']
-            if isinstance(documents, list):
-                for doc in documents:
-                    if isinstance(doc, dict) and doc.get('type') == 'agenda':
-                        return doc.get('url')
-        
-        return None
-    
-    def _merge_session_data(self, primary_sessions: List[SessionMetadata], 
-                           secondary_sessions: List[SessionMetadata]) -> List[SessionMetadata]:
-        """Merge session data from multiple sources."""
-        merged = {}
-        
-        # Add primary sessions
-        for session in primary_sessions:
-            merged[session.session_id] = session
-        
-        # Add/merge secondary sessions
-        for session in secondary_sessions:
-            if session.session_id in merged:
-                # Merge data - enhance existing session
-                existing = merged[session.session_id]
-                if not existing.verbatim_url and session.verbatim_url:
-                    existing.verbatim_url = session.verbatim_url
-                if not existing.agenda_url and session.agenda_url:
-                    existing.agenda_url = session.agenda_url
-            else:
-                # Add new session
-                merged[session.session_id] = session
-        
-        return list(merged.values())
-    
-    def _validate_session_metadata(self, session: SessionMetadata) -> bool:
-        """Validate session metadata quality."""
-        if not session.session_id or len(session.session_id) < 3:
-            return False
-        
-        if not session.date or session.date > datetime.now():
-            return False
-        
-        if session.session_type != 'plenary':
-            return False
-        
-        return True
-    
-    def _enrich_session_metadata(self, session: SessionMetadata) -> SessionMetadata:
-        """Enrich session metadata with additional information."""
-        # Add verbatim URL if missing
-        if not session.verbatim_url:
-            # Generate probable verbatim URL
-            date_str = session.date.strftime('%Y-%m-%d')
-            probable_url = f"https://www.europarl.europa.eu/doceo/document/CRE-9-{date_str}_EN.html"
-            session.verbatim_url = probable_url
-        
-        # Enhance title if empty
-        if not session.title or session.title.strip() == '':
-            session.title = f"Plenary Session - {session.date.strftime('%B %d, %Y')}"
-        
-        return session
+        return validated_sessions
     
     def _load_from_cache(self, cache_key: str) -> Optional[List[SessionMetadata]]:
-        """Load sessions from cache."""
-        if not self.discovery_cache_file.exists():
-            return None
-        
+        """Load sessions from local cache."""
         try:
-            with open(self.discovery_cache_file, 'r') as f:
+            if not self.discovery_cache_file.exists():
+                return None
+            
+            with open(self.discovery_cache_file, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
             
-            if cache_key in cache_data:
-                cached_sessions_data = cache_data[cache_key]
-                
-                # Check cache age (24 hours)
-                cache_time = datetime.fromisoformat(cached_sessions_data['timestamp'])
-                if (datetime.now() - cache_time).total_seconds() > 86400:  # 24 hours
-                    logger.info("Cache expired", cache_key=cache_key)
-                    return None
-                
-                # Convert back to SessionMetadata objects
-                sessions = []
-                for session_data in cached_sessions_data['sessions']:
-                    session = SessionMetadata(
-                        session_id=session_data['session_id'],
-                        date=datetime.fromisoformat(session_data['date']),
-                        title=session_data['title'],
-                        session_type=session_data['session_type'],
-                        language=session_data['language'],
-                        verbatim_url=session_data.get('verbatim_url'),
-                        agenda_url=session_data.get('agenda_url'),
-                        status=session_data['status']
-                    )
+            if cache_key not in cache_data:
+                return None
+            
+            cached_entry = cache_data[cache_key]
+            
+            # Check cache age (24 hours)
+            cache_time = datetime.fromisoformat(cached_entry['timestamp'])
+            if datetime.now() - cache_time > timedelta(hours=24):
+                logger.debug(f"Cache expired for key: {cache_key}")
+                return None
+            
+            # Deserialize sessions
+            sessions = []
+            for session_data in cached_entry['sessions']:
+                try:
+                    session = SessionMetadata(**session_data)
                     sessions.append(session)
-                
-                return sessions
-        
+                    self.sessions_cache[session.session_id] = session
+                except Exception as e:
+                    logger.warning(f"Failed to deserialize cached session: {e}")
+                    continue
+            
+            return sessions
+            
         except Exception as e:
-            logger.warning("Failed to load cache", error=str(e))
-        
-        return None
+            logger.debug(f"Failed to load from cache: {e}")
+            return None
     
-    def _save_to_cache(self, cache_key: str, sessions: List[SessionMetadata]) -> None:
-        """Save sessions to cache."""
+    def _save_to_cache(self, cache_key: str, sessions: List[SessionMetadata]):
+        """Save sessions to local cache."""
         try:
             # Load existing cache
             cache_data = {}
             if self.discovery_cache_file.exists():
-                with open(self.discovery_cache_file, 'r') as f:
+                with open(self.discovery_cache_file, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
             
-            # Convert sessions to serializable format
-            serializable_sessions = []
+            # Serialize sessions
+            session_data = []
             for session in sessions:
-                session_data = {
-                    'session_id': session.session_id,
-                    'date': session.date.isoformat(),
-                    'title': session.title,
-                    'session_type': session.session_type,
-                    'language': session.language,
-                    'verbatim_url': session.verbatim_url,
-                    'agenda_url': session.agenda_url,
-                    'status': session.status
-                }
-                serializable_sessions.append(session_data)
+                try:
+                    session_dict = session.dict()
+                    session_data.append(session_dict)
+                    # Update memory cache
+                    self.sessions_cache[session.session_id] = session
+                except Exception as e:
+                    logger.warning(f"Failed to serialize session for cache: {e}")
+                    continue
             
-            # Save to cache
+            # Store in cache
             cache_data[cache_key] = {
                 'timestamp': datetime.now().isoformat(),
-                'sessions': serializable_sessions
+                'sessions': session_data
             }
             
-            with open(self.discovery_cache_file, 'w') as f:
-                json.dump(cache_data, f, indent=2)
+            # Write cache file
+            with open(self.discovery_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
             
-            logger.info("Sessions saved to cache", cache_key=cache_key, count=len(sessions))
+            logger.debug(f"Saved {len(sessions)} sessions to cache with key: {cache_key}")
             
         except Exception as e:
-            logger.warning("Failed to save cache", error=str(e))
+            logger.warning(f"Failed to save to cache: {e}")
     
     def get_session_by_id(self, session_id: str) -> Optional[SessionMetadata]:
         """Get specific session by ID."""
-        if session_id in self.sessions_cache:
-            return self.sessions_cache[session_id]
-        
-        # Search in cache file
-        if self.discovery_cache_file.exists():
-            try:
-                with open(self.discovery_cache_file, 'r') as f:
-                    cache_data = json.load(f)
-                
-                for cache_key, cached_data in cache_data.items():
-                    for session_data in cached_data.get('sessions', []):
-                        if session_data['session_id'] == session_id:
-                            session = SessionMetadata(
-                                session_id=session_data['session_id'],
-                                date=datetime.fromisoformat(session_data['date']),
-                                title=session_data['title'],
-                                session_type=session_data['session_type'],
-                                language=session_data['language'],
-                                verbatim_url=session_data.get('verbatim_url'),
-                                agenda_url=session_data.get('agenda_url'),
-                                status=session_data['status']
-                            )
-                            return session
-            
-            except Exception as e:
-                logger.warning("Failed to search cache for session", error=str(e))
-        
-        return None
+        return self.sessions_cache.get(session_id)
     
-    def get_sessions_count(self, start_date: str, end_date: str) -> int:
-        """Get count of sessions in date range without full discovery."""
+    def clear_cache(self) -> bool:
+        """Clear discovery cache."""
         try:
-            sessions = self.discover_sessions(start_date, end_date)
-            return len(sessions)
+            if self.discovery_cache_file.exists():
+                self.discovery_cache_file.unlink()
+            
+            if self.batch_cache_file.exists():
+                self.batch_cache_file.unlink()
+            
+            self.sessions_cache.clear()
+            logger.info("Discovery cache cleared")
+            return True
+            
         except Exception as e:
-            logger.error("Failed to get sessions count", error=str(e))
-            return 0
+            logger.error(f"Failed to clear cache: {e}")
+            return False
